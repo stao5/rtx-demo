@@ -58,7 +58,7 @@ typedef struct Point3_t {
 typedef struct Sphere_t {
   Point3 center;
   float radius;
-  char color;
+  char color_raw[4];
 } Sphere;
 
 // Solution to intersection
@@ -93,14 +93,25 @@ typedef struct Light_t {
 #define NUM_SPHERES 3
 #define NUM_LIGHTS 3
 
+#define GREEN_BITS 2
+#define BLUE_BITS 1
+#define RED_BITS 1
+#define TOT_BITS (GREEN_BITS + BLUE_BITS + RED_BITS)
+
+#define GREEN_START 0
+#define BLUE_START GREEN_BITS
+#define RED_START (GREEN_BITS + BLUE_BITS)
+
+#define COLOR_ON_THRESH 0.2f
+
 // -------------------------------------------------------------
 //                           Globals
 // -------------------------------------------------------------
 
 Point3 camera = CAMERA_LOC;
-Sphere spheres[NUM_SPHERES] = {{{0.0f, -1.0f, 3.0f}, 1.0f, CYAN},
-                               {{2.0f, 0.0f, 4.0f}, 1.0f, YELLOW},
-                               {{-2.0f, 0.0f, 4.0f}, 1.0f, GREEN}};
+Sphere spheres[NUM_SPHERES] = {{{0.0f, -1.0f, 3.0f}, 1.0f, {1, 1, 0, 0}},
+                               {{2.0f, 0.0f, 4.0f}, 1.0f, {1, 1, 1, 0}},
+                               {{-2.0f, 0.0f, 4.0f}, 1.0f, {1, 1, 0, 1}}};
 
 // Intensities should not add up to more than 1, so that spots are not
 // overexposed
@@ -234,16 +245,61 @@ char trace_ray(Point3 *cam_ptr, Point3 *scrn_ptr, float t_min, float t_max) {
 
     float intensity = compute_lighting(&sphere_pt, &norm);
 
-    // temporary hack for 4 bit color :(
-    if (intensity <= 0.25) {
-      return closest_sphere->color - 3;
-    } else if (intensity <= 0.31) {
-      return closest_sphere->color - 2;
-    } else if (intensity <= 0.37) {
-      return closest_sphere->color - 1;
-    } else {
-      return closest_sphere->color;
+    intensity /= 0.55;
+
+    if (intensity > 1.0) {
+      intensity = 1.0;
     }
+
+    // color handling code (probably pull out and put in helper)
+    char color = 0;
+
+    // handle green normalizations
+    char green_raw = 0;
+    char green_comp = 0;
+    for (int i = GREEN_START; i < BLUE_START; i++) {
+      green_raw += closest_sphere->color_raw[i] * (1 << (i - GREEN_START));
+    }
+    if (GREEN_BITS == 1) {
+      if (green_raw * intensity > COLOR_ON_THRESH) {
+        green_comp = 1;
+      }
+    } else {
+      green_comp = (char)lroundf((float)(green_raw)*intensity);
+    }
+
+    // handle blue normalizations
+    char blue_raw = 0;
+    char blue_comp = 0;
+    for (int i = BLUE_START; i < RED_START; i++) {
+      blue_raw += closest_sphere->color_raw[i] * (1 << (i - BLUE_START));
+    }
+    if (BLUE_BITS == 1) {
+      if (blue_raw * intensity > COLOR_ON_THRESH) {
+        blue_comp = 1;
+      }
+    } else {
+      blue_comp = (char)lroundf((float)(blue_raw)*intensity);
+    }
+
+    // handle red normalizations
+    char red_raw = 0;
+    char red_comp = 0;
+    for (int i = RED_START; i < TOT_BITS; i++) {
+      red_raw += closest_sphere->color_raw[i] * (1 << (i - RED_START));
+    }
+    if (RED_BITS == 1) {
+      if (red_raw * intensity > COLOR_ON_THRESH) {
+        red_comp = 1;
+      }
+    } else {
+      red_comp = (char)lroundf((float)(red_raw)*intensity);
+    }
+
+    color = (red_comp << RED_START) | (blue_comp << BLUE_START) |
+            (green_comp << GREEN_START);
+
+    return color;
   }
 }
 
@@ -251,13 +307,13 @@ char trace_ray(Point3 *cam_ptr, Point3 *scrn_ptr, float t_min, float t_max) {
 //                          Protothreads
 // -------------------------------------------------------------
 
-// Animation on core 1
+// draw on core 0 (top half of screen)
 static PT_THREAD(protothread_draw(struct pt *pt)) {
   // Mark beginning of thread
   PT_BEGIN(pt);
 
   while (1) {
-    for (int y = 0; y < FRAME_H; y++) {
+    for (int y = 0; y < FRAME_H / 2; y++) {
       for (int x = 0; x < FRAME_W; x++) {
         Point3 vport_coords = canvas_to_viewport(x, y);
         char color = trace_ray(&camera, &vport_coords, 1, INFINITY);
@@ -267,8 +323,35 @@ static PT_THREAD(protothread_draw(struct pt *pt)) {
 
   } // END WHILE(1)
   PT_END(pt);
-} // animation thread
+} // draw thread (Core 0)
 
+// draw on core 1 (bottom half of screen)
+static PT_THREAD(protothread_draw1(struct pt *pt)) {
+  // Mark beginning of thread
+  PT_BEGIN(pt);
+
+  while (1) {
+    for (int y = FRAME_H / 2; y < FRAME_H; y++) {
+      for (int x = 0; x < FRAME_W; x++) {
+        Point3 vport_coords = canvas_to_viewport(x, y);
+        char color = trace_ray(&camera, &vport_coords, 1, INFINITY);
+        drawPixel(x, y, color);
+      }
+    }
+
+  } // END WHILE(1)
+  PT_END(pt);
+} // draw thread (Core 1)
+
+// Core 1 Main
+void core1_main() {
+  // Add animation thread
+  pt_add_thread(protothread_draw1);
+  // Start the scheduler
+  pt_schedule_start;
+}
+
+// Core 0 Main
 int main() {
 
   // Overclock
@@ -279,6 +362,10 @@ int main() {
 
   // Initialize VGA
   initVGA();
+
+  // Initialize second core
+  multicore_reset_core1();
+  multicore_launch_core1(&core1_main);
 
   // add threads
   pt_add_thread(protothread_draw);
