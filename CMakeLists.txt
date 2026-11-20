@@ -27,15 +27,7 @@ project(rtx C CXX ASM)
 # initialize the sdk
 pico_sdk_init()
 
-add_executable(rtx)
-
-# must match with pio filename and executable name from above
-pico_generate_pio_header(rtx ${CMAKE_CURRENT_LIST_DIR}/VGA/hsync.pio)
-pico_generate_pio_header(rtx ${CMAKE_CURRENT_LIST_DIR}/VGA/vsync.pio)
-pico_generate_pio_header(rtx ${CMAKE_CURRENT_LIST_DIR}/VGA/rgb.pio)
-
-# must match with executable name and source file names
-target_sources(rtx PRIVATE rtx.c VGA/vga16_graphics_v3.c)
+add_executable(rtx rtx.c)
 
 # must match with executable name
 target_link_libraries(  rtx
@@ -43,9 +35,12 @@ target_link_libraries(  rtx
                         pico_stdlib
                         pico_bootsel_via_double_reset
                         pico_multicore
+                        pico_mem_ops
                         hardware_pio
                         hardware_dma
-                        hardware_clocks)
+                        hardware_vreg
+                        hardware_clocks
+                        hardware_adc)
 
 # must match with executable name
 pico_add_extra_outputs(rtx)
