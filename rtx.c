@@ -6,23 +6,15 @@
  *
  *
  * HARDWARE CONNECTIONS
-   - GPIO 16 ---> VGA Hsync
-   - GPIO 17 ---> VGA Vsync
-   - GPIO 18 ---> VGA Green lo-bit --> 470 ohm resistor --> VGA_Green
-   - GPIO 19 ---> VGA Green hi_bit --> 330 ohm resistor --> VGA_Green
-   - GPIO 20 ---> 330 ohm resistor ---> VGA-Blue
-   - GPIO 21 ---> 330 ohm resistor ---> VGA-Red
-   - RP2040 GND ---> VGA-GND
+ *
  *
  * RESOURCES USED
- *  - PIO state machines 0, 1, and 2 on PIO instance 0
- *  - DMA channels (2, by claim mechanism)
- *  - 153.6 kBytes of RAM (for pixel color data)
+ *
  *
  */
 
-// Include the DVI grahics library
-// #include "VGA/vga16_graphics_v3.h"
+// Include the DVI grahics library developed by RPi and Bruce Land
+// (bruce.land@cornell.edu)
 #include "DVI/DVIinit_640x480x8_v1.h"
 
 // Include hardware libraries
@@ -47,13 +39,18 @@
 //                    Macros and Custom Types
 // -------------------------------------------------------------
 
-// Point type - What the fuck is a fixed point?? we only use floats here.
-
+// Point type
 typedef struct Point3_t {
   float x;
   float y;
   float z;
 } Point3;
+
+// Color type
+
+typedef struct RGB_t {
+  char color[3];
+} RGB;
 
 // Sphere
 
@@ -61,6 +58,8 @@ typedef struct Sphere_t {
   Point3 center;
   float radius;
   char color[3];
+  int specular;
+  float reflectivity;
 } Sphere;
 
 // Solution to intersection
@@ -69,6 +68,11 @@ typedef struct Soln_t {
   float t1;
   float t2;
 } Soln;
+
+typedef struct SphereTimePair_t {
+  Sphere *sphere_ptr;
+  float t;
+} SphereTimePair;
 
 // Light type
 typedef enum { LIGHT_AMBIENT, LIGHT_POINT, LIGHT_DIRECTIONAL } lightType;
@@ -92,7 +96,7 @@ typedef struct Light_t {
 #define VPORT_H 0.75f
 #define CAMERA_TO_VIEWPORT 1.0f // yields a FOV of approximately 53 deg
 
-#define NUM_SPHERES 3
+#define NUM_SPHERES 4
 #define NUM_LIGHTS 3
 
 #define RED_BITS 3
@@ -104,7 +108,10 @@ typedef struct Light_t {
 #define GREEN_POS 1
 #define BLUE_POS 2
 
-#define WHITE rgb332(7, 7, 3)
+#define WHITE ((RGB){{7, 7, 3}})
+#define DARK ((RGB){{3, 3, 2}})
+
+#define REFLECTION_RECURSION 1 // 3 levels of mirroring
 
 // -------------------------------------------------------------
 //                           Globals
@@ -113,9 +120,18 @@ typedef struct Light_t {
 // NOTE, we're using 332 RGB
 
 Point3 camera = CAMERA_LOC;
-Sphere spheres[NUM_SPHERES] = {{{0.0f, -1.0f, 3.0f}, 1.0f, {7, 2, 1}},
-                               {{2.0f, 0.0f, 4.0f}, 1.0f, {1, 7, 2}},
-                               {{-2.0f, 0.0f, 4.0f}, 1.0f, {5, 2, 3}}};
+Sphere spheres[NUM_SPHERES] = {
+    // FORMAT
+    // Center{x, y, z}, radius, rgb332{r, g, b}, specular factor (how shiny),
+    // reflectivity (how mirror like)
+    // RED
+    {{0.0f, -1.0f, 3.0f}, 1.0f, {7, 2, 1}, 10, 0.2},
+    // GREEN
+    {{2.0f, 0.0f, 4.0f}, 1.0f, {1, 7, 2}, -1, 0.3},
+    // PURPLE
+    {{-2.0f, 0.0f, 4.0f}, 1.0f, {5, 2, 3}, 500, 0.4},
+    // YELLOW (BELOW ALL THE OTHERS)
+    {{0.0f, -5001.0f, 0.0f}, 5000.0f, {7, 7, 0}, 1000, 0.5}};
 
 // Intensities should not add up to more than 1, so that spots are not
 // overexposed
@@ -161,6 +177,14 @@ Point3 canvas_to_viewport(int x, int y) {
                   camera.z + CAMERA_TO_VIEWPORT};
 }
 
+// reflect an incoming ray helper about the normal
+Point3 reflect_ray(Point3 *ray, Point3 *norm) {
+  Point3 rescaled_light_vec = scalar_mul(norm, 2 * dot(norm, ray));
+  Point3 reflect_vec = sub_vec(&rescaled_light_vec, ray);
+
+  return reflect_vec;
+}
+
 // a sphere is relative easy, can be reduced to quadratic equation
 // eventually we may have more shapes
 Soln intersect_ray_sphere(Point3 *cam_ptr, Point3 *scrn_ptr,
@@ -186,38 +210,16 @@ Soln intersect_ray_sphere(Point3 *cam_ptr, Point3 *scrn_ptr,
   return (Soln){s1, s2};
 }
 
-// returns the intensity of the light
-float compute_lighting(Point3 *pt, Point3 *normal) {
-  float intensity = 0.0f;
-  Point3 light_vec;
+// caclulates specular scaling effect with Schlick's Approximation (to avoid
+// costly pow invocation)
 
-  for (int i = 0; i < NUM_LIGHTS; i++) {
-
-    // if ambient, simply add the light intensity
-    if (lights[i].type == LIGHT_AMBIENT) {
-      intensity += lights[i].intensity;
-      continue;
-    }
-    // if point light, calculate vector from src to point
-    else if (lights[i].type == LIGHT_POINT) {
-      light_vec = sub_vec(&lights[i].vect, pt);
-    }
-    // Otherwise, do select parallel ray
-    else {
-      light_vec = lights[i].vect;
-    }
-
-    float n_dot_l = dot(normal, &light_vec);
-    float len_l = sqrtf(dot(&light_vec, &light_vec));
-
-    if (n_dot_l > 0) {
-      intensity += lights[i].intensity * n_dot_l / len_l;
-    }
-  }
-  return intensity;
+float spec_approx(float x, int n) {
+  float denom = (float)n - n * x + x;
+  return x / denom;
 }
 
-char trace_ray(Point3 *cam_ptr, Point3 *scrn_ptr, float t_min, float t_max) {
+SphereTimePair closest_intersection(Point3 *cam_ptr, Point3 *scrn_ptr,
+                                    float t_min, float t_max) {
 
   float closest_t = INFINITY;
   Sphere *closest_sphere = NULL;
@@ -238,10 +240,94 @@ char trace_ray(Point3 *cam_ptr, Point3 *scrn_ptr, float t_min, float t_max) {
     }
   }
 
+  SphereTimePair ret = {closest_sphere, closest_t};
+
+  return ret;
+}
+
+// returns the intensity of the light
+float compute_lighting(Point3 *pt, Point3 *normal, Point3 *to_cam,
+                       int specular) {
+  float intensity = 0.0f;
+  Point3 light_vec;
+
+  float t_max = -1;
+
+  for (int i = 0; i < NUM_LIGHTS; i++) {
+
+    // if ambient, simply add the light intensity
+    if (lights[i].type == LIGHT_AMBIENT) {
+      intensity += lights[i].intensity;
+      continue;
+    }
+    // if point light, calculate vector from src to point
+    else if (lights[i].type == LIGHT_POINT) {
+      light_vec = sub_vec(&lights[i].vect, pt);
+      t_max = 1;
+    }
+    // Otherwise, do select parallel ray
+    else {
+      light_vec = lights[i].vect;
+      t_max = INFINITY;
+    }
+
+    // Shadow Check
+    SphereTimePair shadow_pair =
+        closest_intersection(pt, &light_vec, 0.0001, t_max);
+
+    Sphere *sphere_ptr = shadow_pair.sphere_ptr;
+    // if there is a shadow, don't light
+    if (sphere_ptr != NULL)
+      continue;
+
+    // diffuse lighting
+    float n_dot_l = dot(normal, &light_vec);
+    float len_l = sqrtf(dot(&light_vec, &light_vec));
+
+    if (n_dot_l > 0) {
+      intensity += lights[i].intensity * n_dot_l / len_l;
+    }
+
+    // specular lighting
+    if (specular != -1) {
+
+      Point3 reflect_vec = reflect_ray(&light_vec, normal);
+
+      float r_dot_v = dot(&reflect_vec, to_cam);
+
+      if (r_dot_v > 0) {
+        float len_r = sqrt(dot(&reflect_vec, &reflect_vec));
+        float len_v = sqrt(dot(to_cam, to_cam));
+
+        float cos_alpha = r_dot_v / (len_r * len_v);
+
+        intensity += lights[i].intensity * spec_approx(cos_alpha, specular);
+      }
+    }
+  }
+  return intensity;
+}
+
+RGB trace_ray(Point3 *cam_ptr, Point3 *scrn_ptr, float t_min, float t_max,
+              int recursion_depth) {
+
+  // ======================================
+  // Compute local contribution from sphere
+  // ======================================
+
+  // find nearest intersection with the camera
+  SphereTimePair closest =
+      closest_intersection(cam_ptr, scrn_ptr, t_min, t_max);
+
+  Sphere *closest_sphere = closest.sphere_ptr;
+  float closest_t = closest.t;
+
   if (closest_sphere == NULL) {
-    return WHITE;
+    return DARK;
   } else {
     Point3 ov = sub_vec(scrn_ptr, cam_ptr);
+    Point3 vo = scalar_mul(&ov, -1);
+
     Point3 ov_scaled = scalar_mul(&ov, closest_t);
     Point3 sphere_pt = add_vec(cam_ptr, &ov_scaled);
 
@@ -249,22 +335,50 @@ char trace_ray(Point3 *cam_ptr, Point3 *scrn_ptr, float t_min, float t_max) {
     float norm_mag_scalar = 1 / sqrtf(dot(&norm_unscaled, &norm_unscaled));
     Point3 norm = scalar_mul(&norm_unscaled, norm_mag_scalar);
 
-    float intensity = compute_lighting(&sphere_pt, &norm);
+    float intensity =
+        compute_lighting(&sphere_pt, &norm, &vo, closest_sphere->specular);
 
     if (intensity > 1.0) {
       intensity = 1.0;
     }
 
-    char red_comp =
+    char local_red_comp =
         (char)lroundf((float)(closest_sphere->color[RED_POS]) * intensity);
 
-    char green_comp =
+    char local_green_comp =
         (char)lroundf((float)(closest_sphere->color[GREEN_POS]) * intensity);
 
-    char blue_comp =
+    char local_blue_comp =
         (char)lroundf((float)(closest_sphere->color[BLUE_POS]) * intensity);
 
-    return rgb332(red_comp, green_comp, blue_comp);
+    // ======================================
+    // Compute mirror effect contribution
+    // ======================================
+
+    float r = closest_sphere->reflectivity;
+
+    if (recursion_depth <= 0 || r <= 0)
+      return ((RGB){local_red_comp, local_green_comp, local_blue_comp});
+
+    // Compute reflected color
+    Point3 reflected_ray = reflect_ray(&vo, &norm);
+    Point3 reflected_pt = add_vec(
+        &reflected_ray,
+        &sphere_pt); // trace ray will subtract sphere_pt upon functional call
+
+    RGB reflected_color = trace_ray(&sphere_pt, &reflected_ray, 0.0001,
+                                    INFINITY, recursion_depth - 1);
+
+    char comb_red_comp = lroundf((float)local_red_comp * (1 - r) +
+                                 (float)reflected_color.color[0] * r);
+
+    char comb_green_comp = lroundf((float)local_green_comp * (1 - r) +
+                                   (float)reflected_color.color[1] * r);
+
+    char comb_blue_comp = lroundf((float)local_blue_comp * (1 - r) +
+                                  (float)reflected_color.color[2] * r);
+
+    return ((RGB){comb_red_comp, comb_green_comp, comb_blue_comp});
   }
 }
 
@@ -281,7 +395,10 @@ static PT_THREAD(protothread_draw(struct pt *pt)) {
     for (int y = 0; y < FRAME_H / 2; y++) {
       for (int x = 0; x < FRAME_W; x++) {
         Point3 vport_coords = canvas_to_viewport(x, y);
-        char color = trace_ray(&camera, &vport_coords, 1, INFINITY);
+        RGB split_color = trace_ray(&camera, &vport_coords, 1, INFINITY,
+                                    REFLECTION_RECURSION);
+        char color = rgb332(split_color.color[0], split_color.color[1],
+                            split_color.color[2]);
         drawPixel(x, y, color);
       }
     }
@@ -299,7 +416,10 @@ static PT_THREAD(protothread_draw1(struct pt *pt)) {
     for (int y = FRAME_H / 2; y < FRAME_H; y++) {
       for (int x = 0; x < FRAME_W; x++) {
         Point3 vport_coords = canvas_to_viewport(x, y);
-        char color = trace_ray(&camera, &vport_coords, 1, INFINITY);
+        RGB split_color = trace_ray(&camera, &vport_coords, 1, INFINITY,
+                                    REFLECTION_RECURSION);
+        char color = rgb332(split_color.color[0], split_color.color[1],
+                            split_color.color[2]);
         drawPixel(x, y, color);
       }
     }
