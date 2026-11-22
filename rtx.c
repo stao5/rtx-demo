@@ -111,7 +111,7 @@ typedef struct Light_t {
 #define WHITE ((RGB){{7, 7, 3}})
 #define DARK ((RGB){{3, 3, 2}})
 
-#define REFLECTION_RECURSION 1 // 3 levels of mirroring
+#define REFLECTION_RECURSION 2 // 3 levels of mirroring
 
 // -------------------------------------------------------------
 //                           Globals
@@ -273,7 +273,7 @@ float compute_lighting(Point3 *pt, Point3 *normal, Point3 *to_cam,
 
     // Shadow Check
     SphereTimePair shadow_pair =
-        closest_intersection(pt, &light_vec, 0.0001, t_max);
+        closest_intersection(pt, &light_vec, 0.001, t_max);
 
     Sphere *sphere_ptr = shadow_pair.sphere_ptr;
     // if there is a shadow, don't light
