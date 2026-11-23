@@ -15,7 +15,7 @@
 
 // Include the DVI grahics library developed by RPi and Bruce Land
 // (bruce.land@cornell.edu)
-#include "DVI/DVIinit_640x480x8_v1.h"
+#include "DVI/DVIinit_320x240x24.h"
 
 // Include hardware libraries
 #include "hardware/clocks.h"
@@ -49,7 +49,7 @@ typedef struct Point3_t {
 // Color type
 
 typedef struct RGB_t {
-  char color[3];
+  float color[3];
 } RGB;
 
 // Sphere
@@ -57,7 +57,7 @@ typedef struct RGB_t {
 typedef struct Sphere_t {
   Point3 center;
   float radius;
-  char color[3];
+  float color[3];
   int specular;
   float reflectivity;
 } Sphere;
@@ -83,11 +83,13 @@ typedef struct Light_t {
   Point3 vect;
 } Light;
 
+#define DEBUG_GPIO 11
+
 #define ORIGIN ((Point3){0.0f, 0.0f, 0.0f})
 #define CAMERA_LOC ORIGIN
 
-#define FRAME_W 640
-#define FRAME_H 480
+#define FRAME_W 320
+#define FRAME_H 240
 
 #define CENTER_X (FRAME_W / 2)
 #define CENTER_Y (FRAME_H / 2)
@@ -99,39 +101,36 @@ typedef struct Light_t {
 #define NUM_SPHERES 4
 #define NUM_LIGHTS 3
 
-#define RED_BITS 3
-#define GREEN_BITS 3
-#define BLUE_BITS 2
-#define TOT_BITS (GREEN_BITS + BLUE_BITS + RED_BITS)
-
 #define RED_POS 0
 #define GREEN_POS 1
 #define BLUE_POS 2
 
-#define WHITE ((RGB){{7, 7, 3}})
-#define DARK ((RGB){{3, 3, 2}})
+#define WHITE ((RGB){{1.0f, 1.0f, 1.0f}})
+#define DARK ((RGB){{0.43f, 0.43f, 0.67f}})
 
 #define REFLECTION_RECURSION 2 // 3 levels of mirroring
+
+#define SURFACE_BIAS 0.01f // offset for shadow/reflection ray origins
 
 // -------------------------------------------------------------
 //                           Globals
 // -------------------------------------------------------------
 
-// NOTE, we're using 332 RGB
+// NOTE, we're using 888 RGB, colors are 0.0-1.0 per channel
 
 Point3 camera = CAMERA_LOC;
 Sphere spheres[NUM_SPHERES] = {
     // FORMAT
-    // Center{x, y, z}, radius, rgb332{r, g, b}, specular factor (how shiny),
+    // Center{x, y, z}, radius, rgb{r, g, b}, specular factor (how shiny),
     // reflectivity (how mirror like)
     // RED
-    {{0.0f, -1.0f, 3.0f}, 1.0f, {7, 2, 1}, 10, 0.2},
+    {{0.0f, -1.0f, 3.0f}, 1.0f, {1.00f, 0.29f, 0.33f}, 10, 0.2},
     // GREEN
-    {{2.0f, 0.0f, 4.0f}, 1.0f, {1, 7, 2}, -1, 0.3},
+    {{2.0f, 0.0f, 4.0f}, 1.0f, {0.14f, 1.00f, 0.67f}, -1, 0.3},
     // PURPLE
-    {{-2.0f, 0.0f, 4.0f}, 1.0f, {5, 2, 3}, 500, 0.4},
+    {{-2.0f, 0.0f, 4.0f}, 1.0f, {0.71f, 0.29f, 1.00f}, 500, 0.4},
     // YELLOW (BELOW ALL THE OTHERS)
-    {{0.0f, -5001.0f, 0.0f}, 5000.0f, {7, 7, 0}, 1000, 0.5}};
+    {{0.0f, -5001.0f, 0.0f}, 5000.0f, {1.00f, 1.00f, 0.00f}, 1000, 0.5}};
 
 // Intensities should not add up to more than 1, so that spots are not
 // overexposed
@@ -160,6 +159,15 @@ Point3 sub_vec(Point3 *x1, Point3 *x2) {
 
 Point3 scalar_mul(Point3 *x1, float scalar) {
   return (Point3){x1->x * scalar, x1->y * scalar, x1->z * scalar};
+}
+
+// clamp a 0.0-1.0 color channel and scale it to 0-255
+uint8_t to_byte(float v) {
+  if (v <= 0.0f)
+    return 0;
+  if (v >= 1.0f)
+    return 255;
+  return (uint8_t)(v * 255.0f + 0.5f);
 }
 
 // Turn screen coordinates into viewport point vector relative to origin
@@ -204,8 +212,8 @@ Soln intersect_ray_sphere(Point3 *cam_ptr, Point3 *scrn_ptr,
     return (Soln){INFINITY, INFINITY};
   }
 
-  float s1 = (-b - sqrt(discrim)) / (2 * a);
-  float s2 = (-b + sqrt(discrim)) / (2 * a);
+  float s1 = (-b - sqrtf(discrim)) / (2 * a);
+  float s2 = (-b + sqrtf(discrim)) / (2 * a);
 
   return (Soln){s1, s2};
 }
@@ -272,8 +280,10 @@ float compute_lighting(Point3 *pt, Point3 *normal, Point3 *to_cam,
     }
 
     // Shadow Check
+    // closest_intersection takes a second point on the ray, not a direction
+    Point3 shadow_pt = add_vec(pt, &light_vec);
     SphereTimePair shadow_pair =
-        closest_intersection(pt, &light_vec, 0.001, t_max);
+        closest_intersection(pt, &shadow_pt, 0.001, t_max);
 
     Sphere *sphere_ptr = shadow_pair.sphere_ptr;
     // if there is a shadow, don't light
@@ -296,8 +306,8 @@ float compute_lighting(Point3 *pt, Point3 *normal, Point3 *to_cam,
       float r_dot_v = dot(&reflect_vec, to_cam);
 
       if (r_dot_v > 0) {
-        float len_r = sqrt(dot(&reflect_vec, &reflect_vec));
-        float len_v = sqrt(dot(to_cam, to_cam));
+        float len_r = sqrtf(dot(&reflect_vec, &reflect_vec));
+        float len_v = sqrtf(dot(to_cam, to_cam));
 
         float cos_alpha = r_dot_v / (len_r * len_v);
 
@@ -335,21 +345,22 @@ RGB trace_ray(Point3 *cam_ptr, Point3 *scrn_ptr, float t_min, float t_max,
     float norm_mag_scalar = 1 / sqrtf(dot(&norm_unscaled, &norm_unscaled));
     Point3 norm = scalar_mul(&norm_unscaled, norm_mag_scalar);
 
+    // start secondary rays slightly off the surface (avoids self-hits)
+    Point3 bias = scalar_mul(&norm, SURFACE_BIAS);
+    Point3 start_pt = add_vec(&sphere_pt, &bias);
+
     float intensity =
-        compute_lighting(&sphere_pt, &norm, &vo, closest_sphere->specular);
+        compute_lighting(&start_pt, &norm, &vo, closest_sphere->specular);
 
     if (intensity > 1.0) {
       intensity = 1.0;
     }
 
-    char local_red_comp =
-        (char)lroundf((float)(closest_sphere->color[RED_POS]) * intensity);
+    float local_red_comp = closest_sphere->color[RED_POS] * intensity;
 
-    char local_green_comp =
-        (char)lroundf((float)(closest_sphere->color[GREEN_POS]) * intensity);
+    float local_green_comp = closest_sphere->color[GREEN_POS] * intensity;
 
-    char local_blue_comp =
-        (char)lroundf((float)(closest_sphere->color[BLUE_POS]) * intensity);
+    float local_blue_comp = closest_sphere->color[BLUE_POS] * intensity;
 
     // ======================================
     // Compute mirror effect contribution
@@ -364,19 +375,19 @@ RGB trace_ray(Point3 *cam_ptr, Point3 *scrn_ptr, float t_min, float t_max,
     Point3 reflected_ray = reflect_ray(&vo, &norm);
     Point3 reflected_pt = add_vec(
         &reflected_ray,
-        &sphere_pt); // trace ray will subtract sphere_pt upon functional call
+        &start_pt); // trace ray will subtract start_pt upon functional call
 
-    RGB reflected_color = trace_ray(&sphere_pt, &reflected_ray, 0.0001,
+    RGB reflected_color = trace_ray(&start_pt, &reflected_pt, 0.0001,
                                     INFINITY, recursion_depth - 1);
 
-    char comb_red_comp = lroundf((float)local_red_comp * (1 - r) +
-                                 (float)reflected_color.color[0] * r);
+    float comb_red_comp =
+        local_red_comp * (1 - r) + reflected_color.color[0] * r;
 
-    char comb_green_comp = lroundf((float)local_green_comp * (1 - r) +
-                                   (float)reflected_color.color[1] * r);
+    float comb_green_comp =
+        local_green_comp * (1 - r) + reflected_color.color[1] * r;
 
-    char comb_blue_comp = lroundf((float)local_blue_comp * (1 - r) +
-                                  (float)reflected_color.color[2] * r);
+    float comb_blue_comp =
+        local_blue_comp * (1 - r) + reflected_color.color[2] * r;
 
     return ((RGB){comb_red_comp, comb_green_comp, comb_blue_comp});
   }
@@ -397,12 +408,17 @@ static PT_THREAD(protothread_draw(struct pt *pt)) {
         Point3 vport_coords = canvas_to_viewport(x, y);
         RGB split_color = trace_ray(&camera, &vport_coords, 1, INFINITY,
                                     REFLECTION_RECURSION);
-        char color = rgb332(split_color.color[0], split_color.color[1],
-                            split_color.color[2]);
+        uint32_t color = RGB888(to_byte(split_color.color[0]),
+                                to_byte(split_color.color[1]),
+                                to_byte(split_color.color[2]));
         drawPixel(x, y, color);
       }
     }
-
+    spheres[0].center.z += 0.01;
+    spheres[0].center.y += 0.01;
+    spheres[0].center.x -= 0.02;
+    spheres[2].center.z += 0.05;
+    spheres[2].center.x += 0.01;
   } // END WHILE(1)
   PT_END(pt);
 } // draw thread (Core 0)
@@ -418,12 +434,12 @@ static PT_THREAD(protothread_draw1(struct pt *pt)) {
         Point3 vport_coords = canvas_to_viewport(x, y);
         RGB split_color = trace_ray(&camera, &vport_coords, 1, INFINITY,
                                     REFLECTION_RECURSION);
-        char color = rgb332(split_color.color[0], split_color.color[1],
-                            split_color.color[2]);
+        uint32_t color = RGB888(to_byte(split_color.color[0]),
+                                to_byte(split_color.color[1]),
+                                to_byte(split_color.color[2]));
         drawPixel(x, y, color);
       }
     }
-
   } // END WHILE(1)
   PT_END(pt);
 } // draw thread (Core 1)
@@ -456,6 +472,10 @@ int main() {
 
   // Initialize DVI
   DVIinit();
+
+  // Initialize debug GPIO pin
+  gpio_set_dir(DEBUG_GPIO, GPIO_IN);
+  gpio_pull_up(DEBUG_GPIO);
 
   // Initialize second core
   multicore_reset_core1();
